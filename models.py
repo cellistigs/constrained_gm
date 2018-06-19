@@ -40,7 +40,7 @@ def gener_model_dyn(hidden_activations):
     the recognition model.
     '''
     return (pt.wrap(hidden_activations).
-            fullyconnected(8*8*4,activation_fn=None).
+            fully_connected(8*8*4,activation_fn=None).
             reshape([None,8,8,4]).
             deconv2d(5,4,stride = 2).
             deconv2d(5,4,stride = 2).

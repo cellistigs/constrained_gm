@@ -5,6 +5,7 @@ from skimage.transform import resize
 import matplotlib
 import matplotlib.pyplot as plt
 from models import *
+from costs import *
 
 ## Script to train network.
 
@@ -53,15 +54,22 @@ def block_diagonal(matrices, dtype=tf.float32):
   nb_tensors = shape[0]
   implicit_dim = shape[1]
   indices = tf.range(nb_tensors)
+  # indices = tf.constant([0,1,2,3,4,5,6,7,8,9])
   # We now design an iterable function that will produce "padded" versions of each array that can then
   # be added together with a reduce_sum operation.
-  max_zeros = implicit_dim*(nb_tensors-1)
+  max_zeros = (nb_tensors)-1
   # this is ugly but okay
-  map_padded = lambda args: tf.pad(args[0],tf.constant([[tf.random_normal((1)),5],[5,5]]))
+  # map_padded = lambda args: tf.random_normal([args[1]+15,5],mean = tf.cast(args[1],tf.float32),stddev = tf.cast(args[1],tf.float32),infer_shape = False)
   # map_padded = lambda args: (args[0]*tf.cast(args[1],tf.float32),args[1][0])
 
-  # map_padded = lambda args: tf.pad(args[0],tf.constant([[max_zeros-implicit_dim*args[1],implicit_dim*args[1]],[max_zeros-implicit_dim*args[1],implicit_dim*args[1]]]))
-  block_diag = tf.reduce_sum(tf.map_fn(map_padded,[matrices,indices],dtype = (tf.float32)),axis = 0)
+  # map_padded = lambda args: tf.pad(args[0],tf.Variable([[0,0],[args[1],max_zeros-args[1]]]))
+  # map_padded = lambda args: tf.pad(args[0],tf.Variable([[tf.multiply(implicit_dim,args[1]),max_zeros-tf.multiply(implicit_dim,args[1])],[tf.multiply(implicit_dim,args[1]),max_zeros-tf.multiply(implicit_dim,args[1])]]))
+  pad_matrix = lambda args : tf.concat((tf.concat((tf.tile(tf.zeros([implicit_dim,implicit_dim]),[1,args[0]]),args[1]),axis = 1),tf.tile(tf.zeros([implicit_dim,implicit_dim]),[1,max_zeros-args[0]])),axis=1) #= lambda index: tf.get_variable('padding',shape = (2,2),initializer = tf.constant_initializer([[0,0],[index,max_zeros-index]]))
+  # block_diag = tf.map_fn(pad_calc,indices,dtype = tf.int32)
+
+  block_diag = tf.reshape(tf.map_fn(pad_matrix,(indices,matrices),dtype = tf.float32),(nb_tensors*implicit_dim,nb_tensors*implicit_dim))
+  # block_diag = tf.reduce_sum(tf.map_fn(map_padded,[matrices,indices],dtype = (tf.float32)),axis = 0)
+  # block_diag = tf.map_fn(map_padded,[matrices,indices],dtype = (tf.float32))
 
   # blocked_rows = tf.Dimension(0)
   # blocked_cols = tf.Dimension(0)
@@ -91,7 +99,8 @@ def block_diagonal(matrices, dtype=tf.float32):
   #           axis=0)))
   # blocked = tf.concat(row_blocks, -2)
   # blocked.set_shape(batch_shape.concatenate((blocked_rows, blocked_cols)))
-  return block_diag,max_zeros
+  # return block_diag,max_zeros
+  return block_diag
 
 # Parameters:
 dim_z = 2
@@ -114,21 +123,33 @@ iterator = shuffled.make_initializable_iterator()
 next_images,_,_ = iterator.get_next()
 ### Now we define the flow of information through the network.
 
-## Initialize dynamical parameters, A,Q_0,Q: (Copied from Evan Archer's theano code:
+## Initialize dynamical parameters, A_gen,Q0_gen,Q_gen,A_rec,Q0_rec,Q_rec: (Copied from Evan Archer's theano code:
 #  https://github.com/earcher/vilds/blob/master/code/tutorial.ipynb)
 
-dyn_params = {'A':0.9*np.eye(dim_z),
-              'Q_inv':np.eye(dim_z),
-              'Q0_inv':np.eye(dim_z)}
+rec_params = {'A_rec':0.9*np.eye(dim_z).astype('float32'),
+              'Q_inv_rec':np.eye(dim_z).astype('float32'), ## Qs are Cholesky Decompositions
+              'Q0_inv_rec':np.eye(dim_z).astype('float32')}
+gen_params = {'A_gen':0.8*np.eye(dim_z).astype('float32'),
+              'Q_gen':2*np.eye(dim_z).astype('float32'), ## As above
+              'Q0_gen':2*np.eye(dim_z).astype('float32'),
+              'R_gen':np.ones((128*128*3,)).astype('float32'),
+              'z_0':np.zeros((dim_z,)).astype('float32')}
 print('Calculating Relevant Parameters')
 
 # We can calculate D just once.
-Qinv_full = np.kron(np.eye(batch_size),dyn_params['Q_inv'])
-Qinv_full[0:dim_z,0:dim_z] = dyn_params['Q0_inv']
-A_full = np.kron(np.eye(batch_size,k = -1),dyn_params['A'])
+Q_inv_rec_block = np.dot(rec_params['Q_inv_rec'],rec_params['Q_inv_rec'].T)
+Q0_inv_rec_block = np.dot(rec_params['Q0_inv_rec'],rec_params['Q0_inv_rec'].T)
+Qinv_full = np.kron(np.eye(batch_size),Q_inv_rec_block).astype('float32')
+Qinv_full[0:dim_z,0:dim_z] = Q0_inv_rec_block
+A_full = np.kron(np.eye(batch_size,k = -1),rec_params['A_rec'])
 covar_prop = np.eye(batch_size*dim_z)-A_full
-
 D_inv = np.matmul(np.matmul(covar_prop,Qinv_full),covar_prop.T)
+
+# We can calculate generative parameters just once too. These should be
+# just the standard matrices, not block diagonals.
+Q_inv_gen_full = np.linalg.inv(np.dot(gen_params['Q_gen'],gen_params['Q_gen'].T))
+Q0_inv_gen_full = np.linalg.inv(np.dot(gen_params['Q0_gen'],gen_params['Q0_gen'].T))
+
 
 print('Initializing Tensorflow Model')
 ### Movement through the network: Everything below this should be tensorflow ops!
@@ -144,28 +165,39 @@ with pt.defaults_scope(activation_fn=tf.nn.elu,
 
             ## Stochastic Layer
             # Reshape appropriately:
-            mean_vec = tf.reshape(mean_ind,[batch_size*dim_z])
+            mean_vec = tf.reshape(mean_ind,[batch_size*dim_z,1])
             rs_square= tf.reshape(rs,[batch_size,dim_z,dim_z])
 
             # Construct a covariance matrix by taking rs*rs_transpose
             covars = tf.matmul(rs_square,rs_square,transpose_b = True)
-            print(covars.shape)
+            # print(covars.shape)
             C_inv = block_diagonal(covars)
-            print(C_inv)
+            # print(C_inv)
             # Now we can calculate the matrix square root through Cholesky decomposition,
             # and 'take an inverse' to find the true mean:
-            # Sigma = (D_inv+C_inv)
-            # R = tf.Cholesky(Sigma)
-            #
-            # mean_corr = tf.cholesky_solve(R,tf.matmul(C_inv,mean_vec))
-            #
-            # # Compute correlated noise as another inverse:
-            # noise_corr = tf.matrix_triangular_solve(R,tf.random_normal([batch_size*dim_z]))
-            #
-            # samples = mean_corr+noise_corr
-            #
-            # ## Run samples through the generative model:
-            # generated_images = gener_model_dyn(samples)
+            Sigma = (D_inv+C_inv)
+            R = tf.cholesky(Sigma)
+            shapes = (tf.shape(C_inv),tf.shape(mean_vec))
+            mean_corr = tf.cholesky_solve(R,tf.matmul(C_inv,mean_vec))
+
+            # Compute correlated noise as another inverse:
+            noise_corr = tf.matrix_triangular_solve(R,tf.random_normal([batch_size*dim_z,1]))
+
+            samples = tf.reshape(mean_corr+noise_corr,[10,-1]) ### !!!!!!this is potentially problematic.
+            print(Sigma.shape)
+
+            ## Run samples through the generative model:
+            generated_images = gener_model_dyn(samples)
+
+## Now calculate relevant costs on the generated images:
+
+total_cost = (likelihood_cost(next_images,generated_images,gen_params,batch_size,dim_z)
+             +prior_cost(samples,Q_inv_gen_full,Q0_inv_gen_full,gen_params,dim_z,batch_size)
+             +entropy_cost(R,dim_z,batch_size))
+
+optimizer = tf.train.AdamOptimizer(1e-4,epsilon=1.0).minimize(total_cost)
+
+
 
 print('Running Tensorflow model')
 init = tf.global_variables_initializer()
@@ -174,13 +206,22 @@ init = tf.global_variables_initializer()
 with tf.Session() as sess:
     sess.run(init)
     sess.run(iterator.initializer)
-    z = sess.run(C_inv)
-    print(z,'!')
+    epoch_loss = 0
+    i = 0
     while True:
         try:
-            sess.run(generated_images)
+            print('Percent Completed: '+str(i))
+            _,loss_eval = sess.run([optimizer,total_cost])
+            epoch_loss+=loss_eval
         except tf.errors.OutOfRangeError:
-            break
+            print("End of dataset")
+
+    sess.run(iterator.initializer)
+    z = sess.run([generated_images])
+
+    plt.imshow(z[0,:,:,:])
+    plt.savefig('example.png')
+
 
 
 
