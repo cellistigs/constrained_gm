@@ -3,15 +3,18 @@ import numpy as np
 import imageio
 from skimage.transform import resize
 import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from models import *
 from costs import *
-
+import os
 ## Script to train network.
-
+imsize = 64
 ## Load data:
-filenames = ['datadirectory/toydynamics_nograv/Video_ball_colortrain.tfrecords']
+filenames = ['datadirectory/toydynamics_nograv/Video_ball_color_bigtrain.tfrecords']
 
+def halfsize(image):
+    return resize(image,(imsize,imsize))
 ### Make input pipeline:
 # Define a function that wraps the preprocessing steps:
 def preprocess(serialized_example):
@@ -25,6 +28,8 @@ def preprocess(serialized_example):
     image = tf.decode_raw(features['image'],tf.float64)
 
     image = tf.reshape(image,[128,128,3])
+
+    image = tf.image.resize_images(image,[imsize,imsize])
 
     image = tf.cast(image,tf.float32)
     # image.set_shape
@@ -104,7 +109,7 @@ def block_diagonal(matrices, dtype=tf.float32):
 
 # Parameters:
 dim_z = 2
-batch_size = 10
+batch_size = 50
 
 print('Loading Data')
 # Apply preprocessing
@@ -126,13 +131,13 @@ next_images,_,_ = iterator.get_next()
 ## Initialize dynamical parameters, A_gen,Q0_gen,Q_gen,A_rec,Q0_rec,Q_rec: (Copied from Evan Archer's theano code:
 #  https://github.com/earcher/vilds/blob/master/code/tutorial.ipynb)
 
-rec_params = {'A_rec':0.9*np.eye(dim_z).astype('float32'),
+rec_params = {'A_rec':0.6*np.eye(dim_z).astype('float32'),
               'Q_inv_rec':np.eye(dim_z).astype('float32'), ## Qs are Cholesky Decompositions
               'Q0_inv_rec':np.eye(dim_z).astype('float32')}
-gen_params = {'A_gen':0.8*np.eye(dim_z).astype('float32'),
+gen_params = {'A_gen':0.5*np.eye(dim_z).astype('float32'),
               'Q_gen':2*np.eye(dim_z).astype('float32'), ## As above
               'Q0_gen':2*np.eye(dim_z).astype('float32'),
-              'R_gen':np.ones((128*128*3,)).astype('float32'),
+              'R_gen':np.ones((imsize*imsize*3,)).astype('float32'),
               'z_0':np.zeros((dim_z,)).astype('float32')}
 print('Calculating Relevant Parameters')
 
@@ -155,13 +160,12 @@ print('Initializing Tensorflow Model')
 ### Movement through the network: Everything below this should be tensorflow ops!
 ## Run images through the recognition model:
 with pt.defaults_scope(activation_fn=tf.nn.elu,
-                       batch_normalize = True,
                        learned_moments_update_rate = 0.0003,
                        variance_epsilon = 0.001,
                        scale_after_normalization=True):
     with pt.defaults_scope(phase=pt.Phase.train):
         with tf.variable_scope('model_g') as scope:
-            mean_ind, rs = recog_model_dyn(next_images,dim_z = dim_z)
+            mean_ind, rs = recog_model_dyn(next_images,dim_z = dim_z,dim_x = imsize)
 
             ## Stochastic Layer
             # Reshape appropriately:
@@ -183,44 +187,60 @@ with pt.defaults_scope(activation_fn=tf.nn.elu,
             # Compute correlated noise as another inverse:
             noise_corr = tf.matrix_triangular_solve(R,tf.random_normal([batch_size*dim_z,1]))
 
-            samples = tf.reshape(mean_corr+noise_corr,[10,-1]) ### !!!!!!this is potentially problematic.
-            print(Sigma.shape)
+            samples = tf.placeholder_with_default(tf.reshape(mean_corr+noise_corr,[batch_size,-1]),shape = [batch_size,dim_z],name = 'corr_samples') ### !!!!!!this is potentially problematic.
 
             ## Run samples through the generative model:
             generated_images = gener_model_dyn(samples)
 
 ## Now calculate relevant costs on the generated images:
 
-total_cost = (likelihood_cost(next_images,generated_images,gen_params,batch_size,dim_z)
-             +prior_cost(samples,Q_inv_gen_full,Q0_inv_gen_full,gen_params,dim_z,batch_size)
+total_cost = -(likelihood_cost(next_images,generated_images,gen_params,batch_size,dim_z,imsize)
+             +prior_cost(samples,Q_inv_gen_full,Q0_inv_gen_full,gen_params,dim_z,batch_size,imsize)
              +entropy_cost(R,dim_z,batch_size))
 
 optimizer = tf.train.AdamOptimizer(1e-4,epsilon=1.0).minimize(total_cost)
 
 
 
-print('Running Tensorflow model')
-init = tf.global_variables_initializer()
 
-# saver = tf.train.Saver(max_to_keep=5)
+
+print('Running Tensorflow model')
+checkpointdirectory = 'Video_ball_color_big_ckpts'
+init = tf.global_variables_initializer()
+if not os.path.exists(checkpointdirectory):
+    os.mkdir(checkpointdirectory)
+saver = tf.train.Saver(max_to_keep=1)
 with tf.Session() as sess:
     sess.run(init)
-    sess.run(iterator.initializer)
-    epoch_loss = 0
-    i = 0
-    while True:
-        try:
-            print('Percent Completed: '+str(i))
-            _,loss_eval = sess.run([optimizer,total_cost])
-            epoch_loss+=loss_eval
-        except tf.errors.OutOfRangeError:
-            print("End of dataset")
+    max_epochs = 500
+    for epoch in range(max_epochs):
+        sess.run(iterator.initializer)
+        epoch_loss = 0
+        i = 0
+        while True:
+            try:
+                progress = i/(2400/(batch_size))*100
+                sys.stdout.write("Train progress: %d%%   \r" % (progress) )
+                sys.stdout.flush()
+                _,loss_eval = sess.run([optimizer,total_cost])
+                epoch_loss+=loss_eval
+                i+=1
+            except tf.errors.OutOfRangeError:
+                break
+        print('Loss for epoch '+str(epoch)+': '+str(epoch_loss))
+        save_path = saver.save(sess,checkpointdirectory+'/modelep'+str(epoch)+'.ckpt')
+        if epoch%5 == 1:
+            sess.run(iterator.initializer)
+            z = sess.run((next_images,generated_images))
+            examples = np.concatenate((z[0][0,:,:,:],z[0][20,:,:,:],z[0][40,:,:,:]),axis = 0)
+            reconstr = np.concatenate((z[1][0,:,:,:],z[1][20,:,:,:],z[1][40,:,:,:]),axis = 0)
+            plt.imshow(np.concatenate((examples,reconstr),axis=1))
+            plt.savefig('example_epoch_concat'+str(epoch)+'.png')
+        if epoch == max_epochs-1:
+            sess.run(iterator.initializer)
+            z = sess.run((next_images,generated_images,samples))
+            np.save(checkpointdirectory+'/samples',z[2])
 
-    sess.run(iterator.initializer)
-    z = sess.run([generated_images])
-
-    plt.imshow(z[0,:,:,:])
-    plt.savefig('example.png')
 
 
 
