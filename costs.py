@@ -36,6 +36,7 @@ def likelihood_cost(true_images,gen_images,gen_params,batch_size,dim_z,dim_x):
 def prior_cost(samples,Q_inv_gen,Q0_inv_gen,gen_params,dim_z,batch_size,dim_x):
     ## The prior cost is defined on the latent variables. We require
     ## That they are smooth in time:
+
     dynres = samples[1:,:]-tf.matmul(samples[:-1,:],tf.constant(gen_params['A_gen'].T))
     rmse_dyn = -0.5*tf.reduce_sum(tf.matmul(tf.transpose(dynres),dynres)*Q_inv_gen)
     denom_dyn = 0.5*tf.reduce_sum(tf.log(tf.matrix_determinant(Q_inv_gen)))*(tf.cast(tf.shape(samples)[0],tf.float32)-1)
@@ -46,3 +47,9 @@ def prior_cost(samples,Q_inv_gen,Q0_inv_gen,gen_params,dim_z,batch_size,dim_x):
     prefactor = -0.5*(dim_z+dim_x*dim_x*3)*np.log(2*np.pi)*batch_size
     total_prior = rmse_dyn+denom_dyn+rmse_init+denom_init+prefactor
     return rmse_dyn+denom_dyn+rmse_init+denom_init+prefactor
+
+## If we add in a static term representing the static variable,
+## This can be represented via a KL term that is analytic:
+def KL_stat(means,vars):
+    ## this is the negative "backwards" KL of p with respect to q.
+    return 0.5*tf.reduce_sum(1+vars-tf.square(means)-tf.exp(vars))
