@@ -96,6 +96,18 @@ def gener_model_dyn(hidden_activations):
             deconv2d(5,16,stride = 2).
             deconv2d(5,3,stride = 2,activation_fn=tf.nn.sigmoid)).tensor # 32x32x4
 
+def gener_model_mini(hidden_activations):
+    '''The input to this network (hidden_activations) is a set of sampled activations that
+    represents hidden activations across a batch. They are correlated by means of the structure imposed
+    on the noise that they experience when they are sampled together, but here they should be shaped in a
+    batch-friendly setup, that is once again a 2d tensor: [batch,everything]. We will first connect to a
+    fully connected layer in order to generate input that is correctly shaped for deconvolution that mirrors
+    the recognition model.
+    '''
+    return (pt.wrap(hidden_activations).
+            fully_connected(10,activation_fn=tf.nn.sigmoid,weights=tf.random_uniform_initializer(0.1)).
+            fully_connected(1,activation_fn=tf.nn.sigmoid,weights=tf.random_uniform_initializer(0.1))).tensor # 32x32x4
+
     # return (pt.wrap(hidden_activations).
     #         fully_connected(8*8*64,activation_fn=None,weights=tf.random_uniform_initializer(0.1)).
     #         reshape([None,8,8,64]).

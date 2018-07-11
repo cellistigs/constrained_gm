@@ -11,7 +11,7 @@ import os
 ## Script to train network.
 imsize = 64
 ## Load data:
-filenames = ['datadirectory/toydynamics_nograv/Video_ball_colortrain.tfrecords']
+filenames = ['datadirectory/toydynamics_nograv/Video_ball_color_smalltrain.tfrecords']
 
 def halfsize(image):
     return resize(image,(imsize,imsize))
@@ -110,6 +110,8 @@ def block_diagonal(matrices, dtype=tf.float32):
 # Parameters:
 dim_z = 2
 batch_size = 50
+obs_noise = 0.05 # inverse magnitude of observation noise (std units) (affects R_gen as well)
+
 
 print('Loading Data')
 # Apply preprocessing
@@ -125,7 +127,12 @@ shuffled = batches.repeat(2).shuffle(40)
 ## Make an iterator:
 iterator = shuffled.make_initializable_iterator()
 ## We will initialize and feed through this iterator at training time.
-next_images,_,_ = iterator.get_next()
+next_images_it,_,_ = iterator.get_next()
+
+### This next line is to potentially make our lives easier when performing reconstructions.
+next_images = tf.placeholder_with_default(next_images_it,shape = [None,imsize,imsize,3],name = 'input_samples')
+###
+
 ### Now we define the flow of information through the network.
 
 ## Initialize dynamical parameters, A_gen,Q0_gen,Q_gen,A_rec,Q0_rec,Q_rec: (Copied from Evan Archer's theano code:
@@ -137,7 +144,7 @@ rec_params = {'A_rec':0.9*np.eye(dim_z).astype('float32'),
 gen_params = {'A_gen':0.8*np.eye(dim_z).astype('float32'),
               'Q_gen':2*np.eye(dim_z).astype('float32'), ## As above
               'Q0_gen':2*np.eye(dim_z).astype('float32'),
-              'R_gen':np.ones((imsize*imsize*3,)).astype('float32'),
+              'R_gen':(np.ones((imsize*imsize*3,)).astype('float32')+np.ones((imsize*imsize*3,)).astype('float32')*obs_noise),
               'z_0':np.zeros((dim_z,)).astype('float32')}
 print('Calculating Relevant Parameters')
 
@@ -203,25 +210,32 @@ with pt.defaults_scope(activation_fn=tf.nn.elu,
             ## Run samples through the generative model:
             generated_images = gener_model_dyn(feedsamples)
 
-
+## We want to calculate the cost on a noisy version of the images:
+noised_images = tf.add(tf.clip_by_value(tf.random_normal(shape=[batch_size,imsize,imsize,3],mean = 0.0,stddev = obs_noise,dtype = tf.float32),0,1),next_images)
+# noised_images = next_images
 ## Now calculate relevant costs on the generated images:
 if stat_var == 0:
-    total_cost = -(likelihood_cost(next_images,generated_images,gen_params,batch_size,dim_z,imsize)
+    total_cost = -(likelihood_cost(noised_images,generated_images,gen_params,batch_size,dim_z,imsize)
                  +prior_cost(samples,Q_inv_gen_full,Q0_inv_gen_full,gen_params,dim_z,batch_size,imsize)
                  +entropy_cost(R,dim_z,batch_size))
 else:
-    total_cost = -(likelihood_cost(next_images,generated_images,gen_params,batch_size,dim_z,imsize)
-                 +prior_cost(samples,Q_inv_gen_full,Q0_inv_gen_full,gen_params,dim_z,batch_size,imsize)
-                 +entropy_cost(R,dim_z,batch_size)
-                 +KL_stat(statmean,statvar))
-optimizer = tf.train.AdamOptimizer(5e-5,epsilon=1.0).minimize(total_cost)
+    # total_cost = -(likelihood_cost(noised_images,generated_images,gen_params,batch_size,dim_z,imsize)
+    #              +prior_cost(samples,Q_inv_gen_full,Q0_inv_gen_full,gen_params,dim_z,batch_size,imsize)
+    #              +entropy_cost(R,dim_z,batch_size)
+    #              +KL_stat(statmean,statvar))
+    l_cost = -likelihood_cost(noised_images,generated_images,gen_params,batch_size,dim_z,imsize)
+    p_cost = -prior_cost(samples,Q_inv_gen_full,Q0_inv_gen_full,gen_params,dim_z,batch_size,imsize)
+    e_cost = -entropy_cost(R,dim_z,batch_size)
+    K_cost = -KL_stat(statmean,statvar)
+    total_cost = l_cost+p_cost+e_cost+K_cost
+optimizer = tf.train.AdamOptimizer(5e-5,epsilon=1e-10).minimize(total_cost)
 
 
 
 
 
 print('Running Tensorflow model')
-checkpointdirectory = 'Video_ball_color_statvar_samples_ckpts'
+checkpointdirectory = 'Video_ball_color_statvar_noise_small_2000_ckpts'
 init = tf.global_variables_initializer()
 if not os.path.exists(checkpointdirectory):
     os.mkdir(checkpointdirectory)
@@ -238,22 +252,23 @@ with tf.Session() as sess:
     sess.run(init)
     allmeans = []
     allvars = []
-    max_epochs = 1000
+    max_epochs = 2000
     for epoch in range(max_epochs):
         sess.run(iterator.initializer)
-        epoch_loss = 0
+        # epoch_loss = 0
+        epoch_cost = 0
         i = 0
         while True:
             try:
                 progress = i/(2400/(batch_size))*100
                 sys.stdout.write("Train progress: %d%%   \r" % (progress) )
                 sys.stdout.flush()
-                _,loss_eval = sess.run([optimizer,total_cost])
-                epoch_loss+=loss_eval
+                _,cost = sess.run([optimizer,total_cost])
+                epoch_cost+=cost
                 i+=1
             except tf.errors.OutOfRangeError:
                 break
-        print('Loss for epoch '+str(epoch)+': '+str(epoch_loss))
+        print('Loss for epoch '+str(epoch)+': '+str(epoch_cost))
         save_path = saver.save(sess,checkpointdirectory+'/modelep'+str(epoch)+'.ckpt')
         if epoch%10 == 1:
             sess.run(iterator.initializer)
